@@ -3,7 +3,14 @@ require "db.php";
 
 function scrapePage($url)
 {
-    $html = file_get_contents($url);
+    $context = stream_context_create([
+        "http" => [
+            "timeout" => 15,
+            "header" => "User-Agent: Mozilla/5.0"
+        ]
+    ]);
+
+    $html = file_get_contents($url, false, $context);
 
     libxml_use_internal_errors(true);
     $dom = new DOMDocument();
@@ -26,7 +33,7 @@ function scrapePage($url)
         $link  = $linkNode?->getAttribute("href");
         $ep    = $epNode?->nodeValue ? trim($epNode->nodeValue) : null;
 
-        if ($title) {
+        if ($title && $link) {
             $data[] = [$title, $image, $link, $ep];
         }
     }
@@ -35,16 +42,24 @@ function scrapePage($url)
 }
 
 /*
-    قاعدة الصفحات:
-    page 1 = main page
-    page 2 = 24.html
-    page 3 = 48.html
+    عدد الصفحات
 */
-
-$allData = [];
-
-// عدد الصفحات (غيره حسب الموقع)
 $pages = 58;
+
+$inserted = 0;
+
+/*
+    UPSERT (بدون حذف)
+*/
+$stmt = $pdo->prepare("
+INSERT INTO movies (title, image, link, episodes)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (link)
+DO UPDATE SET
+    title = EXCLUDED.title,
+    image = EXCLUDED.image,
+    episodes = EXCLUDED.episodes
+");
 
 for ($i = 0; $i < $pages; $i++) {
 
@@ -57,26 +72,15 @@ for ($i = 0; $i < $pages; $i++) {
 
     echo "Scraping: $url\n";
 
-    $allData = array_merge($allData, scrapePage($url));
+    $rows = scrapePage($url);
 
-    sleep(1); // مهم عشان ما ينحظر
+    foreach ($rows as $row) {
+        $stmt->execute($row);
+        $inserted++;
+    }
 }
 
 /*
-    امسح القديم
+    النتيجة
 */
-$pdo->exec("DELETE FROM movies");
-
-/*
-    إدخال جديد
-*/
-$stmt = $pdo->prepare("
-    INSERT INTO movies (title, image, link, episodes)
-    VALUES (?, ?, ?, ?)
-");
-
-foreach ($allData as $row) {
-    $stmt->execute($row);
-}
-
-echo "Done: " . count($allData) . " records updated";
+echo "Done. Processed: $inserted records\n";
