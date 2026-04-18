@@ -1,111 +1,156 @@
 <?php
+
 require "db.php";
 
-function get($url) {
-    $opts = [
-        "http" => [
-            "method" => "GET",
-            "header" => "User-Agent: Mozilla/5.0\r\n"
-        ]
-    ];
-    return file_get_contents($url, false, stream_context_create($opts));
+set_time_limit(0);
+ignore_user_abort(true);
+
+$jsonUrl = "https://raw.githubusercontent.com/alooytv/link/refs/heads/main/data.json";
+
+/* =========================
+   CURL FAST
+========================= */
+function curl_get($url)
+{
+    $ch = curl_init();
+
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0'
+        ],
+    ]);
+
+    $data = curl_exec($ch);
+    curl_close($ch);
+
+    return $data;
 }
 
-$json = get("https://raw.githubusercontent.com/alooytv/link/refs/heads/main/data.json");
-$data = json_decode($json, true);
+/* =========================
+   GET BASE URL
+========================= */
+$jsonData = curl_get($jsonUrl);
+$data = json_decode($jsonData, true);
 
-foreach ($data as $item) {
+$startUrl = $data[0]['location_url'];
 
-    // ✅ فلترة
-    if ($item['biolink_block_id'] != "3") continue;
+$parsed = parse_url($startUrl);
+$baseUrl = $parsed['scheme'] . "://" . $parsed['host'] . "/";
 
-    $html = get($item['location_url']);
+/* =========================
+   QUEUE SYSTEM (IMPORTANT)
+========================= */
+$step = 1; // صفحة واحدة فقط كل تشغيل (خفيف جدًا)
 
-    libxml_use_internal_errors(true);
-    $dom = new DOMDocument();
-    $dom->loadHTML($html);
-    $xpath = new DOMXPath($dom);
+$stmtState = $pdo->prepare("SELECT value FROM scraper_state WHERE key = 'page'");
+$stmtSet   = $pdo->prepare("INSERT INTO scraper_state (key,value)
+                            VALUES ('page',:v)
+                            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
 
-    // أدق
-    $movies = $xpath->query("//div[contains(@class,'movie-container')]//div[contains(@class,'col-md-2')]");
+$page = $stmtState->execute() ? (int)$stmtState->fetchColumn() : 0;
 
-    foreach ($movies as $movie) {
+if (!$page) $page = 0;
 
-        $titleNode = $xpath->query(".//h3/a", $movie)->item(0);
-        $imgNode   = $xpath->query(".//img", $movie)->item(0);
-        $linkNode  = $xpath->query(".//a[contains(@class,'ico-play')]", $movie)->item(0);
-        $epNode    = $xpath->query(".//span[contains(@class,'label')]", $movie)->item(0);
+/* =========================
+   BUILD PAGE URL
+========================= */
+$offset = $page * 24;
 
-        $title = trim($titleNode?->nodeValue ?? '');
-        $url   = $linkNode?->getAttribute("href") ?? '';
+$url = ($page == 0)
+    ? $startUrl
+    : $baseUrl . "tvseries/home/{$offset}.html";
 
-        // ✅ معالجة lazy image
-        $image = $imgNode?->getAttribute("src");
-        if (!$image || str_contains($image, "blank_thumbnail")) {
-            $image = $imgNode?->getAttribute("data-src");
-        }
+/* =========================
+   FETCH PAGE
+========================= */
+$html = curl_get($url);
 
-        $episodes = trim($epNode?->nodeValue ?? '');
-
-        if (!$url) continue;
-
-        // ---------------------------
-        // ✅ جلب التفاصيل
-        // ---------------------------
-        $description = '';
-        $release = '';
-        $genres = [];
-
-        try {
-            $innerHtml = get($url);
-
-            $dom2 = new DOMDocument();
-            $dom2->loadHTML($innerHtml);
-            $xp2 = new DOMXPath($dom2);
-
-            // الوصف
-            $descNode = $xp2->query("//div[contains(@class,'col-md-12')]//p")->item(0);
-            $description = trim($descNode?->nodeValue ?? '');
-
-            // Release
-            foreach ($xp2->query("//p") as $p) {
-                if (str_contains($p->nodeValue, "Release")) {
-                    $release = trim(str_replace("Release:", "", $p->nodeValue));
-                }
-            }
-
-            // Genres
-            foreach ($xp2->query("//a[contains(@href,'genre')]") as $g) {
-                $genres[] = trim($g->nodeValue);
-            }
-
-        } catch (Exception $e) {}
-
-        // ---------------------------
-        // ✅ تخزين
-        // ---------------------------
-        $stmt = $pdo->prepare("
-            INSERT INTO movies 
-            (title, image, url, episodes, biolink_block_id)
-            VALUES (:title, :image, :url, :episodes, :bio)
-            ON CONFLICT (url) DO UPDATE SET
-                title = EXCLUDED.title,
-                image = EXCLUDED.image,
-                episodes = EXCLUDED.episodes,
-                biolink_block_id = EXCLUDED.biolink_block_id,
-                updated_at = CURRENT_TIMESTAMP
-        ");
-
-        $stmt->execute([
-            ":title" => $title,
-            ":image" => $image,
-            ":url" => $url,
-            ":episodes" => $episodes,
-            ":bio" => $item['biolink_block_id']
-        ]);
-
-        echo "✔ $title\n";
-    }
+if (!$html) {
+    die("No page found");
 }
 
-echo "DONE\n";
+$html = mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8');
+
+libxml_use_internal_errors(true);
+
+$dom = new DOMDocument();
+@$dom->loadHTML($html);
+$xp = new DOMXPath($dom);
+
+$cards = $xp->query("//div[contains(@class,'latest-movie-img-container')]");
+
+if (!$cards || $cards->length == 0) {
+    die("No data in page $page");
+}
+
+/* =========================
+   DB
+========================= */
+$stmt = $pdo->prepare("
+INSERT INTO movies (title, url, image, episodes, release_date, genre, sort_order)
+VALUES (:title, :url, :image, :episodes, :release_date, :genre, :sort_order)
+ON CONFLICT (url) DO UPDATE SET
+    title = EXCLUDED.title,
+    image = EXCLUDED.image,
+    episodes = EXCLUDED.episodes,
+    sort_order = EXCLUDED.sort_order
+");
+
+$stmtCheck = $pdo->prepare("SELECT 1 FROM movies WHERE url = ?");
+
+$index = $page * 24;
+
+/* =========================
+   PROCESS PAGE ONLY
+========================= */
+foreach ($cards as $card) {
+
+    $titleNode = $xp->query(".//div[contains(@class,'movie-title')]//a", $card);
+    $urlNode   = $xp->query(".//div[contains(@class,'movie-title')]//a", $card);
+    $imgNode   = $xp->query(".//img", $card);
+    $epNode    = $xp->query(".//div[contains(@class,'video_quality')]//span", $card);
+
+    $title = $titleNode->length ? trim($titleNode[0]->nodeValue) : null;
+    $url   = $urlNode->length ? trim($urlNode[0]->getAttribute("href")) : null;
+    $image = $imgNode->length ? trim($imgNode[0]->getAttribute("src")) : null;
+    $ep    = $epNode->length ? trim($epNode[0]->nodeValue) : null;
+
+    if (!$title || !$url) continue;
+
+    $stmtCheck->execute([$url]);
+    if ($stmtCheck->fetchColumn()) continue;
+
+    $index++;
+
+    $stmt->execute([
+        ":title" => $title,
+        ":url" => $url,
+        ":image" => $image,
+        ":episodes" => $ep,
+        ":release_date" => null,
+        ":genre" => null,
+        ":sort_order" => $index
+    ]);
+}
+
+/* =========================
+   UPDATE QUEUE
+========================= */
+$page++;
+
+if ($page > 58) {
+    $page = 0; // إعادة الدورة
+}
+
+$stmtSet->execute([
+    ":v" => $page
+]);
+
+echo "🚀 Page $page synced successfully (NO LOAD, NO LAG)";
