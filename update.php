@@ -1,86 +1,53 @@
 <?php
 require "db.php";
 
-function scrapePage($url)
-{
-    $context = stream_context_create([
-        "http" => [
-            "timeout" => 15,
-            "header" => "User-Agent: Mozilla/5.0"
-        ]
-    ]);
+$json = file_get_contents("https://raw.githubusercontent.com/alooytv/link/refs/heads/main/data.json");
+$data = json_decode($json, true);
 
-    $html = file_get_contents($url, false, $context);
+foreach ($data as $item) {
+    $html = file_get_contents($item['location_url']);
 
     libxml_use_internal_errors(true);
     $dom = new DOMDocument();
     $dom->loadHTML($html);
     $xpath = new DOMXPath($dom);
 
-    $nodes = $xpath->query("//div[contains(@class,'latest-movie-img-container')]");
+    $movies = $xpath->query("//div[contains(@class,'movie-img')]");
 
-    $data = [];
+    foreach ($movies as $movie) {
 
-    foreach ($nodes as $node) {
+        $titleNode = $xpath->query(".//h3/a", $movie)->item(0);
+        $imgNode = $xpath->query(".//img", $movie)->item(0);
+        $linkNode = $xpath->query(".//a[contains(@class,'ico-play')]", $movie)->item(0);
+        $epNode = $xpath->query(".//span", $movie)->item(0);
 
-        $titleNode = $xpath->query(".//div[@class='movie-title']//a", $node)->item(0);
-        $imgNode   = $xpath->query(".//img", $node)->item(0);
-        $linkNode  = $xpath->query(".//div[@class='movie-title']//a", $node)->item(0);
-        $epNode    = $xpath->query(".//span[contains(@class,'label')]", $node)->item(0);
+        $title = $titleNode?->nodeValue;
+        $image = $imgNode?->getAttribute("src") ?: $imgNode?->getAttribute("data-src");
+        $url = $linkNode?->getAttribute("href");
+        $episodes = $epNode?->nodeValue;
 
-        $title = $titleNode?->nodeValue ? trim($titleNode->nodeValue) : null;
-        $image = $imgNode?->getAttribute("src");
-        $link  = $linkNode?->getAttribute("href");
-        $ep    = $epNode?->nodeValue ? trim($epNode->nodeValue) : null;
+        if (!$url) continue;
 
-        if ($title && $link) {
-            $data[] = [$title, $image, $link, $ep];
-        }
-    }
+        // UPSERT (تحديث أو إدخال)
+        $stmt = $pdo->prepare("
+            INSERT INTO movies (title, image, url, episodes, biolink_block_id)
+            VALUES (:title, :image, :url, :episodes, :bio)
+            ON CONFLICT (url) DO UPDATE SET
+                title = EXCLUDED.title,
+                image = EXCLUDED.image,
+                episodes = EXCLUDED.episodes,
+                biolink_block_id = EXCLUDED.biolink_block_id,
+                updated_at = CURRENT_TIMESTAMP
+        ");
 
-    return $data;
-}
-
-/*
-    عدد الصفحات
-*/
-$pages = 58;
-
-$inserted = 0;
-
-/*
-    UPSERT (بدون حذف)
-*/
-$stmt = $pdo->prepare("
-INSERT INTO movies (title, image, link, episodes)
-VALUES (?, ?, ?, ?)
-ON CONFLICT (link)
-DO UPDATE SET
-    title = EXCLUDED.title,
-    image = EXCLUDED.image,
-    episodes = EXCLUDED.episodes
-");
-
-for ($i = 0; $i < $pages; $i++) {
-
-    if ($i == 0) {
-        $url = "https://aj.alooytv13.xyz/tv-series.html";
-    } else {
-        $offset = $i * 24;
-        $url = "https://aj.alooytv13.xyz/tvseries/home/{$offset}.html";
-    }
-
-    echo "Scraping: $url\n";
-
-    $rows = scrapePage($url);
-
-    foreach ($rows as $row) {
-        $stmt->execute($row);
-        $inserted++;
+        $stmt->execute([
+            ":title" => $title,
+            ":image" => $image,
+            ":url" => $url,
+            ":episodes" => $episodes,
+            ":bio" => $item['biolink_block_id']
+        ]);
     }
 }
 
-/*
-    النتيجة
-*/
-echo "Done. Processed: $inserted records\n";
+echo "DONE";
