@@ -34,7 +34,7 @@ function curl_get($url)
 }
 
 /* =========================
-   GET MOVIE DETAILS (NEW)
+   MOVIE DETAILS
 ========================= */
 function getMovieDetails($url)
 {
@@ -49,10 +49,7 @@ function getMovieDetails($url)
 
     $xp = new DOMXPath($dom);
 
-    // Genre
     $genreNode = $xp->query("//p[strong[contains(text(),'Genre')]]//a");
-
-    // Release
     $releaseNode = $xp->query("//p[strong[contains(text(),'Release')]]");
 
     $genre = $genreNode->length ? trim($genreNode[0]->nodeValue) : null;
@@ -67,7 +64,7 @@ function getMovieDetails($url)
 }
 
 /* =========================
-   GET BASE URL
+   BASE URL
 ========================= */
 $jsonData = curl_get($jsonUrl);
 $data = json_decode($jsonData, true);
@@ -78,20 +75,25 @@ $parsed = parse_url($startUrl);
 $baseUrl = $parsed['scheme'] . "://" . $parsed['host'] . "/";
 
 /* =========================
-   QUEUE SYSTEM
+   STATE (PAGE)
 ========================= */
-$stmtState = $pdo->prepare("SELECT value FROM scraper_state WHERE key = 'page'");
-$stmtSet   = $pdo->prepare("
+$stmtStateGet = $pdo->prepare("SELECT value FROM scraper_state WHERE key = 'page'");
+
+$stmtStateSet = $pdo->prepare("
     INSERT INTO scraper_state (key,value)
     VALUES ('page',:v)
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
 ");
 
-$page = $stmtState->execute() ? (int)$stmtState->fetchColumn() : 0;
-if (!$page) $page = 0;
+$stmtStateGet->execute();
+$page = (int)$stmtStateGet->fetchColumn();
+
+if (!$page) {
+    $page = 0;
+}
 
 /* =========================
-   BUILD PAGE URL
+   BUILD URL
 ========================= */
 $offset = $page * 24;
 
@@ -116,14 +118,27 @@ $dom = new DOMDocument();
 @$dom->loadHTML($html);
 $xp = new DOMXPath($dom);
 
+/* =========================
+   CARDS
+========================= */
 $cards = $xp->query("//div[contains(@class,'latest-movie-img-container')]");
 
+/* =========================
+   🔁 RESET IF EMPTY PAGE
+========================= */
 if (!$cards || $cards->length == 0) {
-    die("No data in page $page");
+
+    $page = 0;
+
+    $stmtStateSet->execute([
+        ":v" => $page
+    ]);
+
+    exit("🔁 Empty page detected — reset to page 0");
 }
 
 /* =========================
-   DB
+   DB INSERT
 ========================= */
 $stmt = $pdo->prepare("
 INSERT INTO movies (title, url, image, episodes, release_date, genre, sort_order)
@@ -142,7 +157,7 @@ $stmtCheck = $pdo->prepare("SELECT 1 FROM movies WHERE url = ?");
 $index = $page * 24;
 
 /* =========================
-   PROCESS
+   PROCESS CARDS
 ========================= */
 foreach ($cards as $card) {
 
@@ -158,11 +173,9 @@ foreach ($cards as $card) {
 
     if (!$title || !$url) continue;
 
-    // skip duplicates
     $stmtCheck->execute([$url]);
     if ($stmtCheck->fetchColumn()) continue;
 
-    // 🔥 GET DETAILS FROM INSIDE PAGE
     $details = getMovieDetails($url);
     $genre = $details[0];
     $release_date = $details[1];
@@ -179,20 +192,16 @@ foreach ($cards as $card) {
         ":sort_order" => $index
     ]);
 
-    usleep(150000); // تقليل الضغط
+    usleep(150000);
 }
 
 /* =========================
-   UPDATE QUEUE
+   NEXT PAGE (INFINITE LOOP)
 ========================= */
 $page++;
 
-if ($page > 58) {
-    $page = 0;
-}
-
-$stmtSet->execute([
+$stmtStateSet->execute([
     ":v" => $page
 ]);
 
-echo "🚀 Page $page synced successfully (DETAIL SCRAPER ACTIVE)";
+echo "🚀 Page $page synced successfully";
